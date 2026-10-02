@@ -1,373 +1,183 @@
 import os
 import re
-import sys
-import json
 import time
 import threading
-from datetime import datetime, timedelta
-from urllib.parse import urljoin
 import requests
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
-# ---------------------------------------------------------------- CONFIG
-PORTAL_BASE_URL = "http://135.125.222.224/ints"
-LOGIN_URL = f"{PORTAL_BASE_URL}/login"
-INBOX_URL = f"{PORTAL_BASE_URL}/client/SMSCDRStats"
-DATA_URL = f"{PORTAL_BASE_URL}/client/res/data_smscdr.php"
+# --- ANTI-SLEEP PING ENGINE FOR RENDER ---
+RENDER_APP_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://127.0.0.1:5000')
 
-# Credentials must be set via Koyeb Environment Variables
-USERNAME = os.environ.get("PORTAL_USER", "").strip()
-PASSWORD = os.environ.get("PORTAL_PASS", "").strip()
-APP_URL = os.environ.get("APP_URL", "").strip()  # e.g., https://your-app.koyeb.app
+def keep_alive():
+    """Background thread that pings server every 4 minutes (240s) to prevent Render sleep."""
+    while True:
+        time.sleep(240)
+        try:
+            ping_url = f"{RENDER_APP_URL.rstrip('/')}/ping"
+            response = requests.get(ping_url, timeout=10)
+            print(f"[PINGER] Keep-alive ping sent to {ping_url} | Status: {response.status_code}")
+        except Exception as e:
+            print(f"[PINGER] Ping failed: {e}")
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-})
+# Start anti-sleep thread automatically on startup
+ping_thread = threading.Thread(target=keep_alive, daemon=True)
+ping_thread.start()
 
-portal_lock = threading.Lock()
-served_rows = {}
-portal_info = {"total": None}
-TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?")
+# --- CLI PATTERNS MAPPING ---
+CLI_PATTERNS = {
+    'Microsoft': [r'microsoft', r'msft', r'azure', r'outlook'],
+    'Royal Canin': [r'royal\s*canin', r'canin'],
+    'Ticketmaster': [r'ticketmaster', r'tkmst'],
+    'Google': [r'google', r'g-', r me', r'gmail'],
+    'WhatsApp': [r'whatsapp', r'wa-'],
+    'Telegram': [r'telegram', r't\.me'],
+    'Facebook': [r'facebook', r'fb-'],
+    'Amazon': [r'amazon', r'amzn'],
+    'Uber': [r'uber'],
+    'Apple': [r'apple']
+}
 
-# ---------------------------------------------------------------- KEEP ALIVE PINGER
-def start_keep_alive():
-    """Pings the server every 4 minutes to prevent Koyeb scale-to-zero sleep."""
-    if not APP_URL:
-        print("[Keep-Alive] APP_URL not set in environment variables. Self-ping disabled.")
-        return
+def detect_cli(text, raw_sender=''):
+    combined = f"{raw_sender} {text}".lower()
+    for cli_name, patterns in CLI_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, combined):
+                return cli_name
+    if raw_sender and raw_sender.strip():
+        return raw_sender.strip().title()
+    return 'Other'
 
-    health_url = f"{APP_URL.rstrip('/')}/health"
-    print(f"[Keep-Alive] Started ping loop targeting: {health_url}")
+def extract_code(text):
+    match = re.search(r'\b\d{4,8}\b', text)
+    return match.group(0) if match else ''
 
-    def ping_loop():
-        while True:
-            time.sleep(240)  # Ping every 4 minutes (240 seconds)
-            try:
-                res = requests.get(health_url, timeout=10)
-                print(f"[Keep-Alive] Self-ping status: {res.status_code}")
-            except Exception as err:
-                print(f"[Keep-Alive] Ping failed: {err}")
+# --- MOCK DATA SOURCE (Connect to your DB / Portal API here) ---
+RAW_MESSAGES = [
+    {"id": 1, "number": "+923000000001", "sender": "Microsoft", "text": "Your Microsoft verification code is 482019", "timestamp": "2026-10-02 14:20:00"},
+    {"id": 2, "number": "+923000000002", "sender": "RoyalCanin", "text": "Royal Canin login OTP is 918234", "timestamp": "2026-10-02 15:10:00"},
+    {"id": 3, "number": "+923000000003", "sender": "TicketMaster", "text": "Ticketmaster security code: 334102", "timestamp": "2026-09-15 10:00:00"},
+    {"id": 4, "number": "+923000000001", "sender": "Google", "text": "G-554123 is your Google verification code", "timestamp": "2026-09-01 11:30:00"}
+]
 
-    t = threading.Thread(target=ping_loop, daemon=True)
-    t.start()
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "alive", "message": "Server is active"}), 200
 
-# ---------------------------------------------------------------- LOGIN & HELPERS
-def solve_math_captcha(text):
-    match = re.search(r"(\d{1,2})\s*\+\s*(\d{1,2})", text)
-    if match:
-        return int(match.group(1)) + int(match.group(2))
-    return None
+@app.route('/api/messages', methods=['GET', 'POST'])
+def get_messages():
+    params = request.args if request.method == 'GET' else (request.get_json() or {})
+    
+    cli_filter = params.get('cli', '').strip().lower()
+    number_filter = params.get('number', '').strip()
+    date_filter = params.get('date', '').strip()
+    month_filter = params.get('month', '').strip()
+    start_date = params.get('start_date', '').strip()
+    end_date = params.get('end_date', '').strip()
 
-def build_login_request(html):
-    soup = BeautifulSoup(html, "html.parser")
-    form = soup.find("form")
-    if not form:
-        return None, None
-    captcha = solve_math_captcha(form.get_text(" ")) or solve_math_captcha(soup.get_text(" "))
-    if captcha is None:
-        return None, None
-    payload = {}
-    username_set = False
-    for inp in form.find_all("input"):
-        name = inp.get("name")
-        itype = (inp.get("type") or "text").lower()
-        if not name or itype in ("submit", "button", "image", "checkbox", "radio"):
+    filtered_list = []
+    for item in RAW_MESSAGES:
+        cli = detect_cli(item.get('text', ''), item.get('sender', ''))
+        code = extract_code(item.get('text', ''))
+        number = item.get('number', '')
+        ts_str = item.get('timestamp', '')
+
+        if cli_filter and cli_filter != 'all' and cli.lower() != cli_filter:
             continue
-        lname = name.lower()
-        if itype == "password":
-            payload[name] = PASSWORD
-        elif itype == "hidden":
-            payload[name] = inp.get("value", "")
-        elif any(k in lname for k in ("capt", "answer", "math")):
-            payload[name] = str(captcha)
-        elif not username_set:
-            payload[name] = USERNAME
-            username_set = True
-        else:
-            payload[name] = str(captcha)
-    action = urljoin(LOGIN_URL, form.get("action") or LOGIN_URL)
-    return action, payload
+        if number_filter and number_filter not in number:
+            continue
+        if date_filter and not ts_str.startswith(date_filter):
+            continue
+        if month_filter and not ts_str.startswith(month_filter):
+            continue
+        if start_date and end_date and ts_str[:10]:
+            if not (start_date <= ts_str[:10] <= end_date):
+                continue
 
-def is_logged_in():
-    try:
-        res = session.get(INBOX_URL, timeout=10)
-    except requests.RequestException:
-        return False
-    if res.status_code in (401, 403) or "login" in res.url.lower():
-        return False
-    page = BeautifulSoup(res.text, "html.parser")
-    if page.find("input", {"type": "password"}):
-        return False
-    return True
-
-def login_to_portal():
-    if not USERNAME or not PASSWORD:
-        print("[ERROR] PORTAL_USER or PORTAL_PASS environment variables are missing.")
-        return False
-    try:
-        response = session.get(LOGIN_URL, timeout=10)
-        if response.status_code != 200:
-            print("Failed to load login page")
-            return False
-        action, payload = build_login_request(response.text)
-        if not payload:
-            print("Could not read login form or solve CAPTCHA")
-            return False
-        session.post(action, data=payload, timeout=10)
-        ok = is_logged_in()
-        print("Login successful!" if ok else "Login failed (credentials/CAPTCHA issue)")
-        return ok
-    except Exception as e:
-        print(f"Login Exception: {e}")
-        return False
-
-# ---------------------------------------------------------------- DATA FETCH
-def build_params():
-    now = datetime.now()
-    d1 = (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
-    d2 = (now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
-    params = {
-        "fdate1": d1, "fdate2": d2,
-        "frange": "", "fnum": "", "fcli": "",
-        "fgdate": "", "fgmonth": "", "fgrange": "",
-        "fgnumber": "", "fgcli": "", "fg": 0,
-        "sEcho": 1, "iColumns": 7, "sColumns": ",,,,,,",
-        "iDisplayStart": 0, "iDisplayLength": 500,
-        "sSearch": "", "bRegex": "false",
-        "iSortCol_0": 0, "sSortDir_0": "desc", "iSortingCols": 1,
-        "_": int(now.timestamp() * 1000),
-    }
-    for i in range(7):
-        params.update({
-            f"mDataProp_{i}": i, f"sSearch_{i}": "",
-            f"bRegex_{i}": "false", f"bSearchable_{i}": "true",
-            f"bSortable_{i}": "true",
+        filtered_list.append({
+            "id": item.get('id'),
+            "cli": cli,
+            "number": number,
+            "code": code,
+            "full_text": item.get('text'),
+            "timestamp": ts_str
         })
-    return params
 
-def fetch_rows():
-    headers = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": INBOX_URL,
-        "Accept": "application/json, text/javascript, */*; q=0.01"
-    }
-    with portal_lock:
-        for attempt in range(3):
-            try:
-                session.get(INBOX_URL, timeout=10)
-                r = session.get(DATA_URL, params=build_params(), headers=headers, timeout=15)
-                if "login" in r.url.lower() or r.text.strip().startswith("<!DOCTYPE") or r.text.strip().startswith("<html"):
-                    raise ValueError("Session expired, got HTML")
-                data = r.json()
-                rows = data.get("aaData", [])
-                portal_info["total"] = data.get("iTotalRecords")
-                return rows
-            except Exception as e:
-                print(f"[ERROR] Fetch failed (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    if not login_to_portal():
-                        return None
-                else:
-                    return None
-        return None
+    return jsonify({
+        "status": "success",
+        "total": len(filtered_list),
+        "data": filtered_list
+    })
 
-# ---------------------------------------------------------------- OTP PARSING
-ALNUM_TOKEN = re.compile(r"(?<![\w/@.])([A-Za-z0-9]{4,8})(?![\w@/]|\.\w)")
-OTP_KEYWORD = re.compile(r"otp|code|pin|verification|password|passcode", re.I)
+@app.route('/api/numbers', methods=['GET', 'POST'])
+def get_numbers_range():
+    """Generates / retrieves numbers based on range."""
+    params = request.args if request.method == 'GET' else (request.get_json() or {})
+    start_num = params.get('start', '').strip()
+    end_num = params.get('end', '').strip()
 
-def extract_alnum_otp(message):
-    cands = [(m.start(), m.group(1)) for m in ALNUM_TOKEN.finditer(message)]
-    mixed = [(p, t) for p, t in cands if re.search(r"\d", t) and re.search(r"[A-Za-z]", t)]
-    if not mixed:
-        return None
-    kw = OTP_KEYWORD.search(message)
-    if kw:
-        for p, t in cands:
-            if p >= kw.end() and re.search(r"\d", t):
-                return t
-    return mixed[0][1]
+    result_numbers = []
+    
+    if start_num and end_num:
+        try:
+            # Numeric range extraction
+            s_val = int(re.sub(r'\D', '', start_num))
+            e_val = int(re.sub(r'\D', '', end_num))
+            
+            # Limit max range return to prevent memory overload
+            count = 0
+            for curr in range(s_val, e_val + 1):
+                if count >= 100:
+                    break
+                num_str = f"+{curr}"
+                # Find matching service activity if available
+                active_msg = next((m for m in RAW_MESSAGES if m['number'] == num_str), None)
+                status = f"Active - {detect_cli(active_msg['text'], active_msg['sender'])}" if active_msg else "Idle"
+                
+                result_numbers.append({
+                    "number": num_str,
+                    "status": status
+                })
+                count += 1
+        except Exception:
+            pass
 
-def extract_otp(message, alnum=False):
-    if alnum:
-        found = extract_alnum_otp(message)
-        if found:
-            return found
-    keyword = re.search(r"(?:otp|code|pin|verification)\D{0,25}(\d{4,8})", message, re.I)
-    if keyword:
-        return keyword.group(1)
-    reverse = re.search(r"(\d{4,8})\D{0,25}(?:is your|otp|code)", message, re.I)
-    if reverse:
-        return reverse.group(1)
-    dashed = re.search(r"\b(\d{3})-(\d{3})\b", message)
-    if dashed:
-        return dashed.group(1) + dashed.group(2)
-    plain = re.search(r"\b\d{4,6}\b", message)
-    return plain.group(0) if plain else None
+    if not result_numbers:
+        # Default active numbers response
+        for item in RAW_MESSAGES:
+            cli = detect_cli(item.get('text'), item.get('sender'))
+            result_numbers.append({
+                "number": item.get('number'),
+                "status": f"Active - {cli}"
+            })
 
-def ph_national(number):
-    d = re.sub(r"\D", "", str(number))
-    if d.startswith("63") and len(d) >= 12:
-        d = d[2:]
-    elif d.startswith("0") and len(d) >= 11:
-        d = d[1:]
-    return d[-10:] if len(d) > 10 else d
+    return jsonify({
+        "status": "success",
+        "total": len(result_numbers),
+        "numbers": result_numbers
+    })
 
-def row_matches_phone(cells, target):
-    for cell in cells:
-        token = re.sub(r"[\s+\-().]", "", cell)
-        if re.fullmatch(r"[\d*xX#]{9,15}", token):
-            if token.startswith("63") and len(token) >= 12:
-                token = token[2:]
-            elif token.startswith("0") and len(token) >= 11:
-                token = token[1:]
-            token = token[-10:]
-            if len(token) == len(target):
-                real = [(a, b) for a, b in zip(token, target) if a not in "*xX#"]
-                if len(real) >= 6 and all(a == b for a, b in real):
-                    return True
-    return target in re.sub(r"\D", "", " ".join(cells))
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Returns SMS Statistics."""
+    total_sms = len(RAW_MESSAGES)
+    cli_counts = {}
+    for item in RAW_MESSAGES:
+        cli = detect_cli(item.get('text'), item.get('sender'))
+        cli_counts[cli] = cli_counts.get(cli, 0) + 1
 
-def find_new_otp(rows, target_digits, mark_only=False):
-    seen = served_rows.setdefault(target_digits, set())
-    candidates = []
-    for row in rows:
-        if not isinstance(row, (list, tuple)):
-            continue
-        cells = [BeautifulSoup(str(c), "html.parser").get_text(" ", strip=True) for c in row]
-        row_text = " ".join(cells)
-        if not row_matches_phone(cells, target_digits):
-            continue
-        row_key = row_text
-        if mark_only:
-            seen.add(row_key)
-            continue
-        if row_key in seen:
-            continue
-        stamp = TIMESTAMP_RE.search(row_text)
-        message = max(cells, key=len)
-        otp = extract_otp(message)
-        if otp:
-            candidates.append((stamp.group(0) if stamp else "", otp, row_key))
-    if not candidates:
-        return None
-    best = max(enumerate(candidates), key=lambda x: (x[1][0], -x[0]))[1]
-    seen.add(best[2])
-    return best[1]
+    return jsonify({
+        "status": "success",
+        "total_sms": total_sms,
+        "today_sms": total_sms,
+        "active_clis_count": len(cli_counts),
+        "success_rate": "98%",
+        "cli_breakdown": cli_counts
+    })
 
-# ---------------------------------------------------------------- CORS & ROUTES
-@app.after_request
-def add_cors(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()}), 200
-
-@app.route("/get-otp", methods=["GET"])
-def get_otp():
-    phone_param = request.args.get("phone", "").strip()
-    target_digits = ph_national(phone_param)
-    if not target_digits:
-        return jsonify({"error": "Phone parameter required"}), 400
-    rows = fetch_rows()
-    if rows is None:
-        return jsonify({"error": "Failed to log into SMS portal"}), 500
-    try:
-        otp = find_new_otp(rows, target_digits)
-    except Exception as e:
-        return jsonify({"error": f"Error parsing rows: {e}"}), 500
-    return jsonify({"phone": phone_param, "otp": otp, "rows_seen": len(rows)})
-
-@app.route("/mark-seen", methods=["GET"])
-def mark_seen():
-    phone_param = request.args.get("phone", "").strip()
-    target_digits = ph_national(phone_param)
-    if not target_digits:
-        return jsonify({"error": "Phone parameter required"}), 400
-    rows = fetch_rows()
-    if rows is None:
-        return jsonify({"error": "Failed to log into SMS portal"}), 500
-    find_new_otp(rows, target_digits, mark_only=True)
-    return jsonify({"phone": phone_param, "marked": True})
-
-def extract_number(cells):
-    for cell in cells:
-        token = re.sub(r"[\s+\-().]", "", cell)
-        if re.fullmatch(r"[\d*xX#]{9,15}", token):
-            if token.startswith("63") and len(token) >= 12:
-                token = token[2:]
-            elif token.startswith("0") and len(token) >= 11:
-                token = token[1:]
-            return "+63" + token[-10:]
-    return None
-
-TZ_OFFSET_HOURS = float(os.environ.get("PORTAL_TZ_OFFSET_HOURS", "0"))
-
-def compute_stats(rows, alnum=False):
-    today = (datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
-    data = {}
-    total = 0
-    for row in rows:
-        if not isinstance(row, (list, tuple)):
-            continue
-        cells = [BeautifulSoup(str(c), "html.parser").get_text(" ", strip=True) for c in row]
-        stamp_m = TIMESTAMP_RE.search(" ".join(cells))
-        stamp = stamp_m.group(0) if stamp_m else ""
-        if stamp and stamp[:10] != today:
-            continue
-        total += 1
-        number = extract_number(cells)
-        if not number:
-            continue
-        entry = data.setdefault(number, [])
-        texts = [c for c in cells if not TIMESTAMP_RE.fullmatch(c)] or cells
-        otp = extract_otp(max(texts, key=len), alnum)
-        if otp:
-            entry.append({"otp": otp, "time": stamp[11:19] if stamp else ""})
-
-    numbers = []
-    for n, otps in sorted(data.items(), key=lambda kv: -len(kv[1])):
-        otps = sorted(otps, key=lambda o: o["time"], reverse=True)
-        numbers.append({
-            "number": n,
-            "country_code": n[:3],
-            "local": n[3:],
-            "otp_count": len(otps),
-            "last_otp": otps[0]["otp"] if otps else None,
-            "last_otp_time": otps[0]["time"] if otps else "",
-            "otps": otps,
-        })
-    return {"total_sms": total, "date": today, "alnum": alnum, "numbers": numbers}
-
-@app.route("/stats", methods=["GET"])
-def stats():
-    rows = fetch_rows()
-    if rows is None:
-        return jsonify({"error": "Failed to log into SMS portal"}), 500
-    return jsonify(compute_stats(rows, request.args.get("alnum") == "1"))
-
-@app.route("/restart", methods=["GET"])
-def restart():
-    with portal_lock:
-        served_rows.clear()
-        session.cookies.clear()
-        ok = login_to_portal()
-    if not ok:
-        return jsonify({"error": "Re-login to portal failed"}), 500
-    return stats()
-
-if __name__ == "__main__":
-    login_to_portal()
-    start_keep_alive()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
