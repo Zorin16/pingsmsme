@@ -192,7 +192,14 @@ def add_cors(resp):
     return resp
 
 
+# ---------------------------------------------------------------- KEEP-ALIVE ROUTES
 @app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "online"}), 200
+
+
+# ---------------------------------------------------------------- DYNAMIC DATA ROUTE
 @app.route("/stats", methods=["GET"])
 def stats():
     username = request.headers.get("X-Portal-User")
