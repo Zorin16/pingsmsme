@@ -108,6 +108,16 @@ def extract_code(text):
 def ping():
     return jsonify({"status": "alive", "time": time.time()}), 200
 
+@app.route('/login', methods=['GET'])
+def login_page():
+    return '''<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+    <h2>📱 Portal Hub Login</h2>
+    <p>Server-side portal login is already configured.</p>
+    <button onclick="window.postMessage({type:'FT_LOGIN_SUCCESS'},'*');
+    document.body.innerHTML='<h2>✅ Logged in!</h2><p>Tab band kar dein.</p>'"
+    style="padding:10px 24px;background:#1a73e8;color:#fff;border:none;border-radius:6px;cursor:pointer">Login</button>
+    </body></html>'''
+
 @app.route('/api/messages', methods=['GET', 'POST'])
 def get_messages():
     params = request.args if request.method == 'GET' else (request.get_json() or {})
